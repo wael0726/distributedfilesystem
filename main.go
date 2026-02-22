@@ -2,70 +2,110 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"fmt"
-	"io/ioutil"
+	"io"
 	"log"
+	"os"
+	"os/signal"
+	"syscall"
 	"time"
 
 	"github.com/wael0726/distributedfilesystem/p2p"
 )
 
-func makeServer(listenAddr string, nodes ...string) *FileServer {
-	tcptransportOpts := p2p.TCPTransportOpts{
+func makeServer(listenAddr string, bootstrapNodes ...string) *FileServer {
+	tcpOpts := p2p.TCPTransportOpts{
 		ListenAddr:    listenAddr,
 		HandshakeFunc: p2p.NOPHandshakeFunc,
 		Decoder:       p2p.DefaultDecoder{},
 	}
-	tcpTransport := p2p.NewTCPTransport(tcptransportOpts)
 
-	fileServerOpts := FileServerOpts{
+	transport := p2p.NewTCPTransport(tcpOpts)
+
+	opts := FileServerOpts{
 		EncKey:            newEncryptionKey(),
 		StorageRoot:       listenAddr + "_network",
 		PathTransformFunc: CASPathTransformFunc,
-		Transport:         tcpTransport,
-		BootstrapNodes:    nodes,
+		Transport:         transport,
+		BootstrapNodes:    bootstrapNodes,
 	}
 
-	s := NewFileServer(fileServerOpts)
+	srv := NewFileServer(opts)
+	transport.OnPeer = srv.OnPeer
 
-	tcpTransport.OnPeer = s.OnPeer
-
-	return s
+	return srv
 }
 
 func main() {
-	s1 := makeServer(":3000", "")
-	s2 := makeServer(":7000", "")
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	sigChan := make(chan os.Signal, 1)
+	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
+	go func() {
+		<-sigChan
+		log.Println("Received shutdown signal")
+		cancel()
+	}()
+
+	// Create and start servers
+	s1 := makeServer(":3000")
+	s2 := makeServer(":7000")
 	s3 := makeServer(":5000", ":3000", ":7000")
 
-	go func() { log.Fatal(s1.Start()) }()
-	time.Sleep(500 * time.Millisecond)
-	go func() { log.Fatal(s2.Start()) }()
+	servers := []*FileServer{s1, s2, s3}
 
-	time.Sleep(2 * time.Second)
+	for _, srv := range servers {
+		srv := srv // capture
+		go func() {
+			log.Printf("Starting server on %s", srv.Transport.Addr())
+			if err := srv.Start(); err != nil {
+				log.Printf("Server %s failed: %v", srv.Transport.Addr(), err)
+			}
+		}()
+	}
 
-	go s3.Start()
-	time.Sleep(2 * time.Second)
+	time.Sleep(3 * time.Second)
 
-	for i := 0; i < 20; i++ {
-		key := fmt.Sprintf("picture_%d.png", i)
-		data := bytes.NewReader([]byte("my big data file here!"))
-		s3.Store(key, data)
+	const numFiles = 10
+
+	for i := 0; i < numFiles; i++ {
+		key := fmt.Sprintf("demo_file_%d.txt", i)
+		content := []byte(fmt.Sprintf("This is demo content for file %d", i))
+
+		log.Printf("Storing %s on node %s", key, s3.Transport.Addr())
+
+		if err := s3.Store(key, bytes.NewReader(content)); err != nil {
+			log.Printf("Store failed for %s: %v", key, err)
+			continue
+		}
 
 		if err := s3.store.Delete(s3.ID, key); err != nil {
-			log.Fatal(err)
+			log.Printf("Local delete failed for %s: %v", key, err)
 		}
 
 		r, err := s3.Get(key)
 		if err != nil {
-			log.Fatal(err)
+			log.Printf("Get failed for %s: %v", key, err)
+			continue
 		}
 
-		b, err := ioutil.ReadAll(r)
+		data, err := io.ReadAll(r)
 		if err != nil {
-			log.Fatal(err)
+			log.Printf("Read failed for %s: %v", key, err)
+			continue
 		}
 
-		fmt.Println(string(b))
+		fmt.Printf("Retrieved %s: %s\n", key, string(data))
 	}
+
+	<-ctx.Done()
+
+	log.Println("Shutting down servers...")
+	for _, srv := range servers {
+		srv.Stop()
+	}
+	time.Sleep(500 * time.Millisecond)
+	log.Println("All servers stopped.")
 }

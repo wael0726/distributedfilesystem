@@ -1,23 +1,20 @@
 package p2p
 
 import (
+	"context"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"log"
 	"net"
 	"sync"
+	"time"
 )
 
-// TCPPeer represents the remote node over a TCP established connection.
 type TCPPeer struct {
-	// The underlying connection of the peer. Which in this case
-	// is a TCP connection.
 	net.Conn
-	// if we dial and retrieve a conn => outbound == true
-	// if we accept and retrieve a conn => outbound == false
 	outbound bool
-
-	wg *sync.WaitGroup
+	wg       *sync.WaitGroup
 }
 
 func NewTCPPeer(conn net.Conn, outbound bool) *TCPPeer {
@@ -33,6 +30,17 @@ func (p *TCPPeer) CloseStream() {
 }
 
 func (p *TCPPeer) Send(b []byte) error {
+	if len(b) > MaxMessageSize {
+		return errors.New("payload too large")
+	}
+
+	var lenBuf [4]byte
+	binary.BigEndian.PutUint32(lenBuf[:], uint32(len(b)))
+
+	if _, err := p.Conn.Write(lenBuf[:]); err != nil {
+		return err
+	}
+
 	_, err := p.Conn.Write(b)
 	return err
 }
@@ -51,53 +59,49 @@ type TCPTransport struct {
 }
 
 func NewTCPTransport(opts TCPTransportOpts) *TCPTransport {
+	if opts.Decoder == nil {
+		opts.Decoder = DefaultDecoder
+	}
+
 	return &TCPTransport{
 		TCPTransportOpts: opts,
-		rpcch:            make(chan RPC, 1024),
+		rpcch:            make(chan RPC),
 	}
 }
 
-// Addr implements the Transport interface return the address
-// the transport is accepting connections.
 func (t *TCPTransport) Addr() string {
 	return t.ListenAddr
 }
 
-// Consume implements the Tranport interface, which will return read-only channel
-// for reading the incoming messages received from another peer in the network.
 func (t *TCPTransport) Consume() <-chan RPC {
 	return t.rpcch
 }
 
-// Close implements the Transport interface.
 func (t *TCPTransport) Close() error {
-	return t.listener.Close()
+	if t.listener != nil {
+		return t.listener.Close()
+	}
+	return nil
 }
 
-// Dial implements the Transport interface.
 func (t *TCPTransport) Dial(addr string) error {
-	conn, err := net.Dial("tcp", addr)
+	conn, err := net.DialTimeout("tcp", addr, 5*time.Second)
 	if err != nil {
 		return err
 	}
-
 	go t.handleConn(conn, true)
-
 	return nil
 }
 
 func (t *TCPTransport) ListenAndAccept() error {
 	var err error
-
 	t.listener, err = net.Listen("tcp", t.ListenAddr)
 	if err != nil {
 		return err
 	}
 
+	log.Printf("TCP transport listening on %s", t.ListenAddr)
 	go t.startAcceptLoop()
-
-	log.Printf("TCP transport listening on port: %s\n", t.ListenAddr)
-
 	return nil
 }
 
@@ -107,53 +111,76 @@ func (t *TCPTransport) startAcceptLoop() {
 		if errors.Is(err, net.ErrClosed) {
 			return
 		}
-
 		if err != nil {
-			fmt.Printf("TCP accept error: %s\n", err)
+			log.Printf("accept error: %v", err)
+			continue
 		}
-
 		go t.handleConn(conn, false)
 	}
 }
 
 func (t *TCPTransport) handleConn(conn net.Conn, outbound bool) {
-	var err error
-
 	defer func() {
-		fmt.Printf("dropping peer connection: %s", err)
-		conn.Close()
+		log.Printf("dropping connection from %s: %v", conn.RemoteAddr(), conn.Close())
 	}()
+
+	_ = conn.SetReadDeadline(time.Now().Add(60 * time.Second))
+	_ = conn.SetWriteDeadline(time.Now().Add(60 * time.Second))
 
 	peer := NewTCPPeer(conn, outbound)
 
-	if err = t.HandshakeFunc(peer); err != nil {
+	if err := t.HandshakeFunc(peer); err != nil {
+		log.Printf("handshake failed with %s: %v", conn.RemoteAddr(), err)
 		return
 	}
 
 	if t.OnPeer != nil {
-		if err = t.OnPeer(peer); err != nil {
+		if err := t.OnPeer(peer); err != nil {
+			log.Printf("OnPeer callback failed: %v", err)
 			return
 		}
 	}
 
-	// Read loop
+	go func() {
+		ticker := time.NewTicker(30 * time.Second)
+		defer ticker.Stop()
+		for range ticker.C {
+			if _, err := conn.Write([]byte{}); err != nil {
+				conn.Close()
+				return
+			}
+		}
+	}()
+
 	for {
 		rpc := RPC{}
-		err = t.Decoder.Decode(conn, &rpc)
+		err := t.Decoder.Decode(conn, &rpc)
 		if err != nil {
+			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+				log.Printf("read timeout from %s", conn.RemoteAddr())
+			} else if err != io.EOF {
+				log.Printf("decode error from %s: %v", conn.RemoteAddr(), err)
+			}
 			return
 		}
+
+		_ = conn.SetReadDeadline(time.Now().Add(60 * time.Second))
+		_ = conn.SetWriteDeadline(time.Now().Add(60 * time.Second))
 
 		rpc.From = conn.RemoteAddr().String()
 
 		if rpc.Stream {
 			peer.wg.Add(1)
-			fmt.Printf("[%s] incoming stream, waiting...\n", conn.RemoteAddr())
+			log.Printf("incoming stream from %s, waiting...", conn.RemoteAddr())
 			peer.wg.Wait()
-			fmt.Printf("[%s] stream closed, resuming read loop\n", conn.RemoteAddr())
+			log.Printf("stream closed from %s, resuming read loop", conn.RemoteAddr())
 			continue
 		}
 
-		t.rpcch <- rpc
+		select {
+		case t.rpcch <- rpc:
+		default:
+			log.Printf("rpc channel full from %s - dropping message", conn.RemoteAddr())
+		}
 	}
 }
