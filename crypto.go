@@ -3,87 +3,91 @@ package main
 import (
 	"crypto/aes"
 	"crypto/cipher"
-	"crypto/md5"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/hex"
+	"fmt"
 	"io"
 )
 
 func generateID() string {
-	buf := make([]byte, 32)
-	io.ReadFull(rand.Reader, buf)
-	return hex.EncodeToString(buf)
+	b := make([]byte, 32)
+	if _, err := io.ReadFull(rand.Reader, b); err != nil {
+		panic(err)
+	}
+	return hex.EncodeToString(b)
 }
 
+// hashKey computes SHA-256 of the key and returns it as hex.
 func hashKey(key string) string {
-	hash := md5.Sum([]byte(key))
-	return hex.EncodeToString(hash[:])
+	h := sha256.Sum256([]byte(key))
+	return hex.EncodeToString(h[:])
 }
 
+// newEncryptionKey generates a random 256-bit AES key.
 func newEncryptionKey() []byte {
-	keyBuf := make([]byte, 32)
-	io.ReadFull(rand.Reader, keyBuf)
-	return keyBuf
+	k := make([]byte, 32)
+	if _, err := io.ReadFull(rand.Reader, k); err != nil {
+		panic(err)
+	}
+	return k
 }
 
-func copyStream(stream cipher.Stream, blockSize int, src io.Reader, dst io.Writer) (int, error) {
-	var (
-		buf = make([]byte, 32*1024)
-		nw  = blockSize
-	)
+func copyStream(stream cipher.Stream, src io.Reader, dst io.Writer) (int64, error) {
+	var total int64
+	buf := make([]byte, 32*1024)
+
 	for {
 		n, err := src.Read(buf)
 		if n > 0 {
 			stream.XORKeyStream(buf, buf[:n])
-			nn, err := dst.Write(buf[:n])
-			if err != nil {
-				return 0, err
+			nn, werr := dst.Write(buf[:n])
+			total += int64(nn)
+			if werr != nil {
+				return total, werr
 			}
-			nw += nn
 		}
 		if err == io.EOF {
 			break
 		}
 		if err != nil {
-			return 0, err
+			return total, err
 		}
 	}
-	return nw, nil
+	return total, nil
 }
 
-func copyDecrypt(key []byte, src io.Reader, dst io.Writer) (int, error) {
+func copyEncrypt(key []byte, src io.Reader, dst io.Writer) (int64, error) {
 	block, err := aes.NewCipher(key)
 	if err != nil {
-		return 0, err
+		return 0, fmt.Errorf("cipher creation: %w", err)
 	}
 
-	// Read the IV from the given io.Reader which, in our case should be the
-	// the block.BlockSize() bytes we read.
-	iv := make([]byte, block.BlockSize())
-	if _, err := src.Read(iv); err != nil {
-		return 0, err
-	}
-
-	stream := cipher.NewCTR(block, iv)
-	return copyStream(stream, block.BlockSize(), src, dst)
-}
-
-func copyEncrypt(key []byte, src io.Reader, dst io.Writer) (int, error) {
-	block, err := aes.NewCipher(key)
-	if err != nil {
-		return 0, err
-	}
-
-	iv := make([]byte, block.BlockSize()) // 16 bytes
+	iv := make([]byte, aes.BlockSize)
 	if _, err := io.ReadFull(rand.Reader, iv); err != nil {
-		return 0, err
+		return 0, fmt.Errorf("IV generation: %w", err)
 	}
 
-	// prepend the IV to the file.
 	if _, err := dst.Write(iv); err != nil {
-		return 0, err
+		return 0, fmt.Errorf("IV write: %w", err)
 	}
 
 	stream := cipher.NewCTR(block, iv)
-	return copyStream(stream, block.BlockSize(), src, dst)
+	n, err := copyStream(stream, src, dst)
+	return n + int64(len(iv)), err
+}
+
+func copyDecrypt(key []byte, src io.Reader, dst io.Writer) (int64, error) {
+	block, err := aes.NewCipher(key)
+	if err != nil {
+		return 0, fmt.Errorf("cipher creation: %w", err)
+	}
+
+	iv := make([]byte, aes.BlockSize)
+	if _, err := io.ReadFull(src, iv); err != nil {
+		return 0, fmt.Errorf("IV read: %w", err)
+	}
+
+	stream := cipher.NewCTR(block, iv)
+	return copyStream(stream, src, dst)
 }
