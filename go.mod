@@ -1,3 +1,5 @@
+module github.com/wael0726/distributedfilesystem
+
 go 1.18
 
 require (
