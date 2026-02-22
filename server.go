@@ -379,16 +379,39 @@ func (s *FileServer) handleMessage(from string, msg *Message) error {
 }
 
 func (s *FileServer) handleMessageStoreFile(from string, msg MessageStoreFile) error {
-	peer, _ := s.peers[from] 
+    peer, ok := s.peers[from]
+    if !ok {
+        return fmt.Errorf("peer (%s) not found", from)
+    }
 
-	n, err := s.store.Write(msg.ID, msg.Key, io.LimitReader(peer, msg.Size))
-	if err != nil {
-		return err
-	}
+    n, err := s.store.Write(msg.ID, msg.Key, io.LimitReader(peer, msg.Size))
+    if err != nil {
+        return err
+    }
 
-	log.Printf("[%s] stored %d bytes for %s from %s", s.Transport.Addr(), n, msg.Key, from)
-	peer.CloseStream()
-	return nil
+    _, r, err := s.store.Read(msg.ID, msg.Key)
+    if err != nil {
+        return fmt.Errorf("read back for integrity: %w", err)
+    }
+    defer r.Close()
+
+    writtenData, err := io.ReadAll(r)
+    if err != nil {
+        return fmt.Errorf("integrity readall: %w", err)
+    }
+
+    computedHash := sha256.Sum256(writtenData)
+    computedStr := hex.EncodeToString(computedHash[:])
+    if computedStr != msg.Hash {
+        s.store.Delete(msg.ID, msg.Key) // Cleanup corrupted file
+        return errors.New("integrity check failed: hash mismatch")
+    }
+
+    fmt.Printf("[%s] written %d bytes to disk from %s\n", s.Transport.Addr(), n, from)
+
+    peer.CloseStream()
+
+    return nil
 }
 
 func (s *FileServer) handleMessageGetFile(from string, msg MessageGetFile) error {
