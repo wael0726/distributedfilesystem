@@ -9,6 +9,7 @@ import (
 	"log"
 	"os"
 	"strings"
+	"sync"
 )
 
 const defaultRootFolderName = "ggnetwork"
@@ -66,6 +67,7 @@ var DefaultPathTransformFunc = func(key string) PathKey {
 
 type Store struct {
 	StoreOpts
+	mu sync.RWMutex
 }
 
 func NewStore(opts StoreOpts) *Store {
@@ -82,6 +84,8 @@ func NewStore(opts StoreOpts) *Store {
 }
 
 func (s *Store) Has(id string, key string) bool {
+	s.mu.Lock()
+    defer s.mu.Unlock()
 	pathKey := s.PathTransformFunc(key)
 	fullPathWithRoot := fmt.Sprintf("%s/%s/%s", s.Root, id, pathKey.FullPath())
 
@@ -94,6 +98,8 @@ func (s *Store) Clear() error {
 }
 
 func (s *Store) Delete(id string, key string) error {
+	s.mu.Lock()
+    defer s.mu.Unlock()
 	pathKey := s.PathTransformFunc(key)
 
 	defer func() {
@@ -106,10 +112,14 @@ func (s *Store) Delete(id string, key string) error {
 }
 
 func (s *Store) Write(id string, key string, r io.Reader) (int64, error) {
+	s.mu.Lock()
+    defer s.mu.Unlock()
 	return s.writeStream(id, key, r)
 }
 
 func (s *Store) WriteDecrypt(encKey []byte, id string, key string, r io.Reader) (int64, error) {
+	s.mu.Lock()
+    defer s.mu.Unlock()
 	f, err := s.openFileForWriting(id, key)
 	if err != nil {
 		return 0, err
@@ -139,6 +149,8 @@ func (s *Store) writeStream(id string, key string, r io.Reader) (int64, error) {
 }
 
 func (s *Store) Read(id string, key string) (int64, io.Reader, error) {
+	s.mu.Lock()
+    defer s.mu.Unlock()
 	return s.readStream(id, key)
 }
 
